@@ -1,25 +1,16 @@
 # Linux sound detector (PipeWire/Pulse)
 
-Прототип под CachyOS/Arch: слушает **реальный аудиовыход** через monitor-source PipeWire/PulseAudio и ищет заранее известный звук внутри общего микса.
+Детектор под CachyOS/Arch: слушает реальный аудиовыход через PipeWire/Pulse monitor и ищет заранее известный звук внутри общего микса.
 
-Он не читает память Roblox/Sober, не внедряется в процесс и не зависит от Roblox cache. Детектор работает с PCM-потоком, который уже отправляется на колонки/наушники.
+Он не читает память Roblox/Sober, не внедряется в процесс и не зависит от Roblox cache.
 
-Для присланного звука используется готовый `target_fingerprint.json`; сам OGG для обычного запуска не нужен.
+Для присланного звука уже лежит готовый `target_fingerprint.json`. Сам OGG для обычного запуска не нужен.
 
-## Установка на CachyOS / Arch
+## Установка
 
 ```bash
 sudo pacman -S --needed python python-numpy python-scipy ffmpeg libpulse
 ```
-
-Проверь monitor-source:
-
-```bash
-pactl get-default-sink
-pactl list short sources
-```
-
-Обычно нужный source заканчивается на `.monitor`.
 
 ## Запуск
 
@@ -27,65 +18,92 @@ pactl list short sources
 python detector.py
 ```
 
-При совпадении:
+После запуска программа молчит. В консоль выводятся только реальные срабатывания, например:
 
 ```text
-[22:15:01] TARGET DETECTED #1 votes=123 runner_up=20 matched=170
+[22:15:01] DETECTED #1 (votes=82, runner=11)
+[22:23:44] DETECTED #2 (votes=76, runner=9)
 ```
 
-Чтобы выполнить действие:
+Остановить:
+
+```text
+Ctrl+C
+```
+
+После остановки будет итог:
+
+```text
+Detected total: 2
+```
+
+Один и тот же проигрываемый звук не должен спамить несколькими событиями подряд: после срабатывания детектор блокируется и ждёт, пока target исчезнет из аудиопотока, прежде чем снова разрешить счёт.
+
+## Выполнить действие при детекте
+
+Например, уведомление KDE:
 
 ```bash
 python detector.py --command 'notify-send "Target sound" "detected"'
 ```
 
-Или любой свой скрипт:
+Или свой скрипт:
 
 ```bash
 python detector.py --command './action.sh'
 ```
 
-## Если auto выбрал не тот monitor
+## Обновить уже клонированный репозиторий
+
+```bash
+git pull
+python detector.py
+```
+
+## Если выбран не тот аудиовыход
+
+Посмотреть monitor sources:
 
 ```bash
 pactl list short sources
+```
+
+И указать нужный вручную:
+
+```bash
 python detector.py --source 'alsa_output....monitor'
 ```
 
-По умолчанию слушается monitor **default sink**, то есть весь звук на текущем устройстве вывода. Другие программы и игровые эффекты могут звучать одновременно: fingerprint ищет согласованную во времени комбинацию спектральных пиков, а не полное совпадение waveform.
+По умолчанию берётся monitor текущего default sink.
 
-## Настройка
+## Настройка чувствительности
 
-Для начала:
+Обычно ничего менять не нужно.
+
+Если target иногда пропускается:
 
 ```bash
-python detector.py --debug
+python detector.py --threshold 35
 ```
 
-Основные параметры:
+Если появляются ложные срабатывания:
 
-- `--threshold 45` — минимальное число fingerprint-votes. Ниже = чувствительнее, но выше риск false positive.
-- `--ratio 1.6` — лучший временной offset должен выигрывать у второго места.
-- `--window 0.70` — rolling window в секундах.
-- `--step 0.10` — период проверки.
-- `--cooldown 1.5` — защита от повторного trigger одного проигрывания.
+```bash
+python detector.py --threshold 60
+```
 
-На чистом присланном файле стандартный порог пересекается примерно через **0.4 с** от начала. В реальной игре задержка зависит от громкости target и количества одновременно звучащих эффектов.
+Дополнительно:
 
-## Сделать fingerprint для другого звука
+- `--threshold 45` — минимальное количество fingerprint votes.
+- `--ratio 1.6` — насколько лучший временной offset должен превосходить второй.
+- `--window 0.70` — окно анализа.
+- `--step 0.10` — частота проверки.
+- `--cooldown 1.0` — абсолютный минимум между событиями.
+- `--rearm 0.45` — сколько target должен отсутствовать перед разрешением следующего события.
+
+## Другой target
 
 ```bash
 python build_fingerprint.py other.ogg -o other.json
 python detector.py --fingerprint other.json
 ```
-
-## Как это работает
-
-1. `parec` читает monitor default sink как mono 16 kHz PCM.
-2. Поток разбивается на короткие FFT-окна.
-3. Выбираются выраженные спектральные пики.
-4. Пары пиков превращаются в hashes `(freq1, freq2, delta_time)`.
-5. В live-аудио ищется множество hashes с одним временным сдвигом относительно reference.
-6. Когда один offset набирает достаточно votes, выполняется action.
-
-Это landmark/fingerprint-поиск, поэтому посторонние звуки обычно добавляют лишние пики, но не уничтожают согласованный рисунок target.
