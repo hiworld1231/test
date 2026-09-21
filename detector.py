@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ def load_index(path: str | Path):
         a, b, dt = (int(x) for x in key.split(","))
         index[(a, b, dt)] = [int(t) for t in times]
 
-    return index, data
+    return index
 
 
 def run_text(cmd: list[str]) -> str:
@@ -41,9 +42,7 @@ def run_text(cmd: list[str]) -> str:
     )
 
     if proc.returncode != 0:
-        raise RuntimeError(
-            proc.stderr.strip() or f"{' '.join(cmd)} failed"
-        )
+        raise RuntimeError(proc.stderr.strip() or f"{' '.join(cmd)} failed")
 
     return proc.stdout.strip()
 
@@ -61,63 +60,52 @@ def pulse_monitor_source(requested: str) -> str:
     wanted = sink + ".monitor"
 
     sources = []
-
     for line in run_text(["pactl", "list", "short", "sources"]).splitlines():
         parts = line.split("\t")
-
         if len(parts) >= 2:
             sources.append(parts[1])
 
     if wanted in sources:
         return wanted
 
-    monitors = [s for s in sources if s.endswith(".monitor")]
-
+    monitors = [source for source in sources if source.endswith(".monitor")]
     if monitors:
         return monitors[0]
 
     raise RuntimeError(
-        "no Pulse/PipeWire monitor source found; "
-        "try: pactl list short sources"
+        "no Pulse/PipeWire monitor source found; try: pactl list short sources"
     )
 
 
 def execute_action(command: str, event_no: int, result) -> None:
     now = time.strftime("%H:%M:%S")
-
     print(
-        f"\n[{now}] TARGET DETECTED #{event_no} "
-        f"votes={result.votes} "
-        f"runner_up={result.runner_up} "
-        f"matched={result.matched_hashes}",
+        f"[{now}] DETECTED #{event_no} "
+        f"(votes={result.votes}, runner={result.runner_up})",
         flush=True,
     )
 
-    if command:
-        env = os.environ.copy()
-        env.update(
-            {
-                "SOUND_MATCH_VOTES": str(result.votes),
-                "SOUND_MATCH_RUNNER_UP": str(result.runner_up),
-                "SOUND_MATCHED_HASHES": str(result.matched_hashes),
-            }
-        )
+    if not command:
+        return
 
-        subprocess.Popen(
-            command,
-            shell=True,
-            env=env,
-        )
+    env = os.environ.copy()
+    env.update(
+        {
+            "SOUND_MATCH_VOTES": str(result.votes),
+            "SOUND_MATCH_RUNNER_UP": str(result.runner_up),
+            "SOUND_MATCHED_HASHES": str(result.matched_hashes),
+            "SOUND_DETECTION_COUNT": str(event_no),
+        }
+    )
+
+    subprocess.Popen(command, shell=True, env=env)
 
 
 def is_detection(result, threshold: int, ratio: float) -> bool:
     if result.votes < threshold:
         return False
 
-    return (
-        result.runner_up == 0
-        or result.votes >= result.runner_up * ratio
-    )
+    return result.runner_up == 0 or result.votes >= result.runner_up * ratio
 
 
 def detect_array(index, audio: np.ndarray, args) -> int:
@@ -126,13 +114,11 @@ def detect_array(index, audio: np.ndarray, args) -> int:
     first_end = max(int(0.30 * SAMPLE_RATE), step_samples)
 
     events = 0
-    last = -1e9
+    armed = True
+    quiet_since: float | None = None
+    last_detection = -1e9
 
-    for end in range(
-        first_end,
-        len(audio) + step_samples,
-        step_samples,
-    ):
+    for end in range(first_end, len(audio) + step_samples, step_samples):
         chunk = audio[
             max(0, end - window_samples):
             min(end, len(audio))
@@ -142,31 +128,26 @@ def detect_array(index, audio: np.ndarray, args) -> int:
             continue
 
         result = match(index, chunk)
-
-        if args.debug:
-            print(
-                f"t={min(end, len(audio))/SAMPLE_RATE:6.2f}s "
-                f"votes={result.votes:4d} "
-                f"runner={result.runner_up:3d}",
-                flush=True,
-            )
-
         now = end / SAMPLE_RATE
+        detected = is_detection(result, args.threshold, args.ratio)
 
-        if (
-            is_detection(result, args.threshold, args.ratio)
-            and now - last >= args.cooldown
-        ):
-            events += 1
-            execute_action(
-                args.command,
-                events,
-                result,
-            )
-            last = now
+        if detected:
+            quiet_since = None
 
-            if args.once:
-                return events
+            if armed and now - last_detection >= args.cooldown:
+                events += 1
+                execute_action(args.command, events, result)
+                last_detection = now
+                armed = False
+
+                if args.once:
+                    return events
+        else:
+            if quiet_since is None:
+                quiet_since = now
+
+            if not armed and now - quiet_since >= args.rearm:
+                armed = True
 
     return events
 
@@ -178,14 +159,6 @@ def detect_live(index, args) -> int:
         )
 
     source = pulse_monitor_source(args.source)
-
-    print(f"source: {source}")
-    print(
-        f"listening: {SAMPLE_RATE} Hz mono | "
-        f"window={args.window:.2f}s | "
-        f"threshold={args.threshold}"
-    )
-    print("Ctrl+C to stop.\n")
 
     cmd = [
         "parec",
@@ -204,20 +177,18 @@ def detect_live(index, args) -> int:
 
     assert proc.stdout is not None
 
-    step_samples = max(
-        1,
-        int(args.step * SAMPLE_RATE),
-    )
-    window_samples = max(
-        step_samples,
-        int(args.window * SAMPLE_RATE),
-    )
+    step_samples = max(1, int(args.step * SAMPLE_RATE))
+    window_samples = max(step_samples, int(args.window * SAMPLE_RATE))
 
     blocks = deque()
     buffered = 0
     events = 0
+
+    # One physical playback should count once even if several consecutive
+    # analysis windows match it.
+    armed = True
+    quiet_since: float | None = None
     last_detection = -1e9
-    last_debug = 0.0
 
     try:
         while True:
@@ -225,74 +196,50 @@ def detect_live(index, args) -> int:
 
             if not raw:
                 stderr = (
-                    proc.stderr.read().decode(
-                        "utf-8",
-                        errors="replace",
-                    )
+                    proc.stderr.read().decode("utf-8", errors="replace")
                     if proc.stderr
                     else ""
                 )
+                raise RuntimeError(stderr.strip() or "parec stopped")
 
-                raise RuntimeError(
-                    stderr.strip() or "parec stopped"
-                )
-
-            block = np.frombuffer(
-                raw,
-                dtype="<f4",
-            ).astype(
-                np.float32,
-                copy=True,
-            )
-
+            block = np.frombuffer(raw, dtype="<f4").astype(np.float32, copy=True)
             blocks.append(block)
             buffered += len(block)
 
-            while (
-                blocks
-                and buffered - len(blocks[0]) >= window_samples
-            ):
+            while blocks and buffered - len(blocks[0]) >= window_samples:
                 buffered -= len(blocks.popleft())
 
             if buffered < int(0.30 * SAMPLE_RATE):
                 continue
 
             window = np.concatenate(tuple(blocks))
-
             if len(window) > window_samples:
                 window = window[-window_samples:]
 
             result = match(index, window)
             now = time.monotonic()
+            detected = is_detection(result, args.threshold, args.ratio)
 
-            if args.debug and now - last_debug >= 0.5:
-                print(
-                    f"votes={result.votes:4d} "
-                    f"runner={result.runner_up:3d} "
-                    f"matched={result.matched_hashes:4d}",
-                    flush=True,
-                )
-                last_debug = now
+            if detected:
+                quiet_since = None
 
-            if (
-                is_detection(
-                    result,
-                    args.threshold,
-                    args.ratio,
-                )
-                and now - last_detection >= args.cooldown
-            ):
-                events += 1
-                execute_action(
-                    args.command,
-                    events,
-                    result,
-                )
-                last_detection = now
+                if armed and now - last_detection >= args.cooldown:
+                    events += 1
+                    execute_action(args.command, events, result)
+                    last_detection = now
+                    armed = False
 
-                if args.once:
-                    return events
+                    if args.once:
+                        return events
+            else:
+                if quiet_since is None:
+                    quiet_since = now
 
+                if not armed and now - quiet_since >= args.rearm:
+                    armed = True
+
+    except KeyboardInterrupt:
+        return events
     finally:
         proc.terminate()
 
@@ -301,33 +248,19 @@ def detect_live(index, args) -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    return events
 
-
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Detect one known sound inside a mixed "
-            "Linux desktop audio stream."
-        )
+        description="Detect one known sound inside a mixed Linux audio stream."
     )
 
-    parser.add_argument(
-        "--fingerprint",
-        default="target_fingerprint.json",
-    )
+    parser.add_argument("--fingerprint", default="target_fingerprint.json")
     parser.add_argument(
         "--source",
         default="auto",
-        help=(
-            "Pulse/PipeWire source; default: "
-            "monitor of default sink"
-        ),
+        help="Pulse/PipeWire source; default: monitor of default sink",
     )
-    parser.add_argument(
-        "--input-file",
-        help="Offline test instead of live capture",
-    )
+    parser.add_argument("--input-file", help="Offline test instead of live capture")
     parser.add_argument(
         "--command",
         default="",
@@ -360,47 +293,44 @@ def main() -> None:
     parser.add_argument(
         "--cooldown",
         type=float,
-        default=1.5,
-        help="Seconds before another trigger",
+        default=1.0,
+        help="Absolute minimum seconds between detections",
     )
     parser.add_argument(
-        "--once",
-        action="store_true",
+        "--rearm",
+        type=float,
+        default=0.45,
+        help="How long the target must be absent before another detection is allowed",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-    )
+    parser.add_argument("--once", action="store_true")
 
     args = parser.parse_args()
-    index, meta = load_index(args.fingerprint)
-
-    print(
-        f"fingerprint: {len(index)} unique hashes / "
-        f"{meta.get('hash_count', '?')} total"
-    )
+    index = load_index(args.fingerprint)
 
     if args.input_file:
         audio = decode_audio(args.input_file)
-        events = detect_array(
-            index,
-            audio,
-            args,
-        )
-        print(f"detections: {events}")
-        return
+        return detect_array(index, audio, args)
 
-    detect_live(index, args)
+    return detect_live(index, args)
+
+
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _interrupt)
+        except (ValueError, OSError):
+            pass
+
     try:
-        main()
+        count = main()
+        print(f"Detected total: {count}", flush=True)
     except KeyboardInterrupt:
-        print("\nstopped")
+        # Fallback for an interrupt before live capture is fully initialized.
+        print("Detected total: 0", flush=True)
     except Exception as exc:
-        print(
-            f"error: {exc}",
-            file=sys.stderr,
-        )
+        print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
